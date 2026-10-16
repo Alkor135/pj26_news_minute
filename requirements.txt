@@ -1,0 +1,13 @@
+# Зависимости расчёта минутных реакций и графика finplot.
+# Установка из корня: .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+colorama==0.4.6
+finplot==1.9.7
+numpy==2.5.4
+pandas==3.0.6
+PyQt6==6.11.0
+PyQt6-Qt6==6.11.2
+PyQt6_sip==13.13.0
+pyqtgraph==0.14.0
+python-dateutil==2.9.0.post0
+six==1.17.0
+tzdata==2026.5

@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Локальные данные, векторы и генерируемые отчёты
+/data/
+/logs/
+/tests/tmp*/
