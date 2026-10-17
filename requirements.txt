@@ -1,5 +1,10 @@
-# Зависимости расчёта минутных реакций и графика finplot.
+# Общие зависимости расчётов, графика finplot и QLoRA-обучения.
+# Проверено: Windows x64, Python 3.14.8, NVIDIA RTX 4070, CUDA 12.8.
 # Установка из корня: .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+# Дополнительный официальный индекс нужен для CUDA-сборки PyTorch.
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+# Расчёты и график.
 colorama==0.4.6
 finplot==1.9.7
 numpy==2.5.4
@@ -11,3 +16,17 @@ pyqtgraph==0.14.0
 python-dateutil==2.9.0.post0
 six==1.17.0
 tzdata==2026.5
+
+# Обучение и экспорт модели; фактические версии пишутся в training_manifest.json.
+torch==2.11.0+cu128
+transformers==4.57.6
+peft==0.21.2
+accelerate==1.15.0
+bitsandbytes==0.50.2
+safetensors==0.8.0
+huggingface-hub==0.36.2
+
+# Конвертация в GGUF средствами llama.cpp.
+gguf==0.19.0
+sentencepiece==0.2.2
+protobuf==4.25.9

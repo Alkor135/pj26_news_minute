@@ -85,11 +85,18 @@
 
 ## Окружение
 
-Зависимости графика и расчётов зафиксированы в `requirements.txt`:
+Общие зависимости графика, расчётов и обучения зафиксированы в `requirements.txt`.
+Установка в `.venv` с Python 3.14 на Windows:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip check
 ```
+
+Файл включает официальный индекс PyTorch и закреплённую сборку
+`torch==2.11.0+cu128` для NVIDIA CUDA 12.8. Отдельный список зависимостей
+обучения не используется. Проверка QLoRA на GPU описана в
+[README эксперимента](experiments_-10_10/README.md).
 
 Запуск Python из PowerShell без активации окружения:
 
@@ -399,3 +406,50 @@ build_analogs.py или russian_market.py; по умолчанию 1. Перес
 k к тому же сентябрю — исследование параметра; независимую проверку проводят позже.
 
 Результат сравнения: [docs/threshold-tuning-results.md](docs/threshold-tuning-results.md).
+
+## Просмотр сигналов с декабря 2025 по сентябрь 2026
+
+В отдельной БД оценок период запросов расширен до [01.12.2025,01.10.2026).
+История, эмбеддинги и реакции взяты из годового набора. Для каждого запроса
+по-прежнему допускаются только разные прошлые даты в пределах года; при нехватке
+года используется доступная часть истории. Это просмотр сигналов, не симуляция
+исполненных сделок. Прежняя сентябрьская БД сохранена.
+
+```powershell
+.\.venv\Scripts\python.exe build_analogs.py --reaction-db data\russian_market\2026-09_year1\reactions\reactions.sqlite3 --pilot-dir data\russian_market\2026-09_year1\pilot --output data\russian_market\2025-12_2026-09\analogs --history-years 1 --query-start 2025-12-01 --query-end 2026-10-01 --threshold-multiplier 0.5
+.\.venv\Scripts\python.exe view_news_finplot.py --database data\russian_market\2026-09_year1\reactions\reactions.sqlite3 --analogs data\russian_market\2025-12_2026-09\analogs\analogs.sqlite3 --instrument RTS --horizon 15 --selection-mode analogs --threshold-multiplier 0.5
+```
+
+Список показывает события всего периода, график — минутное окно выбранного
+события. Модель, инструмент, горизонт и k переключаются в окне. Поля метаданных
+показывают фактический период запросов. Реакции/свечи по-прежнему читаются из
+2026-09_year1/reactions, новый файл содержит оценки расширенного периода.
+
+## Разметка реакций −10…+10: этап 3 эксперимента
+
+`experiments_-10_10/build_rasmetka.py` отдельно выполняет третий этап согласованной
+последовательности: загружает новости за сентябрь 2025 — август 2026,
+оставляет решения `include` текущего российского тематического фильтра,
+рассчитывает реакции MIX/RTS на горизонтах 5, 15, 30, 60 и 120 минут и
+присваивает согласованные баллы «величина × качество». Реализация повторно
+использует `source/build_reactions.py`, `source/price_reactions.py` и
+`source/market_relevance.py`; исходные RSS SQLite и ZIP котировок открываются
+только для чтения. Готовый файл `data/experiments_-10_10/scores.jsonl` является
+входом отдельных скриптов дообучения четвёртого этапа. Оркестратор пока не нужен.
+
+Примеры из корня проекта:
+
+```powershell
+.\.venv\Scripts\python.exe experiments_-10_10/build_rasmetka.py
+.\.venv\Scripts\python.exe experiments_-10_10/build_rasmetka.py --reaction-db data\russian_market\2026-09_year1\reactions\reactions.sqlite3
+.\.venv\Scripts\python.exe experiments_-10_10/build_rasmetka.py --start 2025-09-01 --end-exclusive 2026-09-01 --output data\experiments_-10_10\scores.jsonl
+.\.venv\Scripts\python.exe experiments_-10_10/build_rasmetka.py --help
+```
+
+`--reaction-db` повторно использует готовые совместимые реакции, проверяет их
+версию и параметры и пересчитывает только баллы. По умолчанию скрипт читает
+RSS и тики и строит отдельную БД реакций внутри `data/experiments_-10_10`.
+Неполные окна сохраняются с `score=null`; балл 0 означает только нейтральную
+полную реакцию. Сводка записывается в `scores_summary.json`. Файловых логов нет.
+Полная формула, состав полей JSONL и следующий этап описаны в
+[README эксперимента](experiments_-10_10/README.md).
