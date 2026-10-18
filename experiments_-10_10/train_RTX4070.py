@@ -8,6 +8,8 @@ batch=1, накопление=16, длина=512. Потребление пам�
 По умолчанию --task extremes: классы negative (-10..-8), none (-7..7),
 positive (8..10); балансируется только обучение. Каталог RTX4070_extremes.
 --task score сохраняет прежнюю балльную задачу и каталог RTX4070.
+Финальный сентябрь задаётся --evaluation-role test и границами периода;
+при этом нужен отдельный файл данных с сентябрём и новый --output.
 
 Из корня проекта в .venv с зависимостями из корневого requirements.txt:
   python experiments_-10_10/train_RTX4070.py
@@ -15,6 +17,7 @@ positive (8..10); балансируется только обучение. Ка
   python experiments_-10_10/train_RTX4070.py --task score --output data/experiments_-10_10/RTX4070_score_retry
   python experiments_-10_10/train_RTX4070.py --data data/experiments_-10_10/scores.jsonl --epochs 1
   python experiments_-10_10/train_RTX4070.py --help
+  python experiments_-10_10/train_RTX4070.py --evaluation-role test --validation-start 2026-09-01 --cutoff 2026-10-01 --data data/experiments_-10_10/scores_test_202609.jsonl --output data/experiments_-10_10/RTX4070_extremes_test_202609 --dry-run
 """
 
 from pathlib import Path

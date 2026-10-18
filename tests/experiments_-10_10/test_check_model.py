@@ -1,11 +1,15 @@
 r"""Проверяет метрики оценки Ollama и исключение утечки целевого балла.
 
 Внешний Ollama не запускается. Временные данные создаются только в tests.
+Проверяет допуск финального сентября по явной роли test, без допуска в validation.
 Запуск: .\.venv\Scripts\python.exe -m unittest discover -s tests/experiments_-10_10 -p test_check_model.py -v
 """
 
 import importlib.util
+import hashlib
+import json
 from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -44,6 +48,32 @@ class ModelCheckTests(unittest.TestCase):
         result = module.metrics([{'actual': 1, 'predicted': None}])
         self.assertIsNone(result['mae'])
         self.assertEqual(result['invalid_fraction'], 1)
+
+    def test_prepare_september_requires_explicit_test_role(self):
+        """Сохранённый сентябрьский тест восстанавливается без использования его в обучении."""
+        module = load_check()
+        with tempfile.TemporaryDirectory(prefix='tmp_model_check_', dir=ROOT / 'tests') as temp:
+            run = Path(temp)
+            rows = [dict(news_id=month, title=f'Новость {month}', instrument='MIX', horizon=5,
+                         score=8, stable=False, score_version='test',
+                         loaded_at=f'2026-{month}-15 10:00:00', end_at=f'2026-{month}-15 10:05:01')
+                    for month in ('08', '09')]
+            data = run / 'scores.jsonl'
+            data.write_text('\n'.join(json.dumps(r) for r in rows), encoding='utf-8')
+            parameters = dict(train_start='2025-09-01', validation_start='2026-09-01',
+                              cutoff='2026-10-01', evaluation_role='test')
+            manifest = dict(task='extremes', parameters=parameters)
+            (run / 'training_manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
+            (run / 'data_report.json').write_text(json.dumps({'data_sha256': hashlib.sha256(data.read_bytes()).hexdigest()}), encoding='utf-8')
+            (run / 'validation_predictions.json').write_text(json.dumps([
+                dict(news_id='09', instrument='MIX', horizon=5, actual=8, predicted='positive')
+            ]), encoding='utf-8')
+            selected, _ = module.prepare_cases(run, data, 0)
+            self.assertEqual([r['news_id'] for r in selected], ['09'])
+            manifest['parameters']['evaluation_role'] = 'validation'
+            (run / 'training_manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'test'):
+                module.prepare_cases(run, data, 0)
 
     def test_request_excludes_label_and_disallows_extra_fields(self):
         """В запрос не попадает actual; ответ с лишними полями отклоняется."""

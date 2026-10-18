@@ -12,11 +12,15 @@
 По умолчанию task=extremes: баллы ±8…±10 преобразуются в negative/positive,
 остальные — в none. Балансируется только обучение после временного разделения.
 Результаты сохраняются в PROFILE_extremes; --task score сохраняет прежнюю задачу.
+Для финального сентября явно задать --evaluation-role test,
+--validation-start 2026-09-01 --cutoff 2026-10-01 и отдельный --output.
+В режиме test не оценивает отложенный период между эпохами и не выбирает по нему модель.
 
 Запуск из корня через профиль:
   python experiments_-10_10/train_RTX4070.py --dry-run
   python experiments_-10_10/train_RTX3090Ti.py --epochs 1
   python experiments_-10_10/train_RTX4070.py --task score --dry-run
+  python experiments_-10_10/train_RTX4070.py --evaluation-role test --validation-start 2026-09-01 --cutoff 2026-10-01 --data data/experiments_-10_10/scores_test_202609.jsonl --output data/experiments_-10_10/RTX4070_extremes_test_202609 --dry-run
 Параметры: python experiments_-10_10/train_RTX4070.py --help.
 Этот модуль отдельно не запускается. Формат разметки описан в соседнем README.md.
 """
@@ -56,6 +60,20 @@ def parse_time(value):
     """Возвращает datetime МСК из ISO-строки; время без зоны трактует как МСК."""
     parsed = datetime.fromisoformat(str(value))
     return parsed.replace(tzinfo=MSK) if parsed.tzinfo is None else parsed.astimezone(MSK)
+
+
+def validate_evaluation_period(parameters):
+    """Проверяет явную роль проверочного периода parameters и возвращает validation либо test.
+
+Старые манифесты без роли относятся к validation. Сентябрь 2026 и более поздние
+данные разрешены только при явной роли test; границы разделения проверяются отдельно.
+"""
+    role = parameters.get('evaluation_role', 'validation')
+    if role not in ('validation', 'test'):
+        raise ValueError('evaluation-role должен быть validation либо test')
+    if parse_time(parameters['cutoff']) > parse_time('2026-09-01') and role != 'test':
+        raise ValueError('Для проверки сентября 2026 нужен явный --evaluation-role test')
+    return role
 
 
 def integer(value, name):
@@ -285,6 +303,8 @@ def train_adapter(args, train_rows, validation_rows):
 
     train_rows уже преобразованы и сбалансированы в main, validation_rows сохранены
     без балансировки. База из Hugging Face заморожена; обучаются только LoRA-матрицы.
+    При evaluation_role=test отложенная выборка оценивается только после train,
+    промежуточная оценка по эпохам отключена; финальный адаптер не выбирается по тесту.
     """
     cache = ROOT / 'data' / 'experiments_-10_10' / 'hf_cache'
     os.environ.setdefault('HF_HOME', str(cache))
@@ -334,14 +354,15 @@ def train_adapter(args, train_rows, validation_rows):
         gradient_checkpointing_kwargs={'use_reentrant': False},
         bf16=dtype == torch.bfloat16, fp16=dtype == torch.float16,
         optim='adamw_torch', warmup_ratio=0.03, lr_scheduler_type='cosine',
-        eval_strategy='epoch', save_strategy='no', logging_strategy='steps', logging_steps=10,
+        eval_strategy='no' if args.evaluation_role == 'test' else 'epoch',
+        save_strategy='no', logging_strategy='steps', logging_steps=10,
         report_to=[], seed=args.seed, data_seed=args.seed, dataloader_num_workers=0,
         remove_unused_columns=False, prediction_loss_only=True)
     trainer = Trainer(model=model, args=training_args, train_dataset=train_data,
                       eval_dataset=valid_data,
                       data_collator=DataCollatorForSeq2Seq(tokenizer, padding=True, label_pad_token_id=-100))
     manifest = dict(profile=args.profile, model=args.model, revision=revision, gpu=gpu,
-                    parameters=vars(args), task=args.task,
+                    parameters=vars(args), task=args.task, evaluation_role=args.evaluation_role,
                     system_prompt=EXTREME_PROMPT if args.task == 'extremes' else SYSTEM_PROMPT,
                     packages={name: version(name) for name in
                               ('torch', 'transformers', 'peft', 'bitsandbytes', 'accelerate')},
@@ -354,7 +375,9 @@ def train_adapter(args, train_rows, validation_rows):
     adapter_dir = args.output / 'adapter'
     model.save_pretrained(adapter_dir, safe_serialization=True)
     tokenizer.save_pretrained(adapter_dir)
-    save_json(args.output / 'training_metrics.json', dict(train=trained.metrics, validation=validation_metrics))
+    save_json(args.output / 'training_metrics.json', dict(
+        train=trained.metrics, evaluation_role=args.evaluation_role,
+        **{args.evaluation_role: validation_metrics}))
     numeric, predictions = evaluate_predictions(model, tokenizer, validation_rows, args.prediction_limit, args.seed)
     save_json(args.output / 'score_metrics.json', numeric)
     if args.task == 'extremes':
@@ -384,6 +407,8 @@ def build_parser(profile):
     parser.add_argument('--train-start', default='2025-09-01', help='Начало истории, включительно, МСК')
     parser.add_argument('--validation-start', default='2026-08-01', help='Начало отложенной валидации, МСК')
     parser.add_argument('--cutoff', default='2026-09-01', help='Конец доступной истории, исключительно, МСК')
+    parser.add_argument('--evaluation-role', choices=('validation', 'test'), default='validation',
+                        help='Роль отложенных данных; test отключает оценку между эпохами')
     parser.add_argument('--epochs', type=float, default=1, help='Число проходов по обучению')
     parser.add_argument('--max-steps', type=int, default=-1, help='Ограничение шагов; положительное заменяет epochs')
     parser.add_argument('--batch-size', type=int, default=defaults['batch_size'], help='Примеры на один шаг GPU')
@@ -406,9 +431,10 @@ def main(profile, argv=None):
     parser = build_parser(profile)
     args = parser.parse_args(argv)
     args.profile = profile
-    args.prediction_limit = args.prediction_limit if args.prediction_limit is not None else (0 if args.task == 'extremes' else 256)
+    args.prediction_limit = args.prediction_limit if args.prediction_limit is not None else (0 if args.task == 'extremes' or args.evaluation_role == 'test' else 256)
     args.output = args.output or ROOT / 'data' / 'experiments_-10_10' / (profile + ('_extremes' if args.task == 'extremes' else ''))
     try:
+        validate_evaluation_period(vars(args))
         if (any(getattr(args, name) <= 0 for name in ('batch_size', 'accumulation', 'max_length', 'rank'))
                 or not math.isfinite(args.epochs) or args.epochs <= 0
                 or not math.isfinite(args.learning_rate) or args.learning_rate <= 0
@@ -433,7 +459,8 @@ def main(profile, argv=None):
         args.output.mkdir(parents=True, exist_ok=True)
         with args.data.open('rb') as handle:
             digest = hashlib.file_digest(handle, 'sha256').hexdigest()
-        report = dict(profile=profile, task=args.task, model=args.model, data_sha256=digest, parameters=vars(args),
+        report = dict(profile=profile, task=args.task, evaluation_role=args.evaluation_role,
+                      model=args.model, data_sha256=digest, parameters=vars(args),
                       train_before_balance=original_train, balance=balance,
                       read=read_stats, split=split_stats, train=summarize(train), validation=summarize(valid),
                       warning='Без group_id обнаруживаются только точные нормализованные перепечатки; '

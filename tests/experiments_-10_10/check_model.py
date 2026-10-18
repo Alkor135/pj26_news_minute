@@ -1,4 +1,4 @@
-r"""Проверяет импортированную модель Ollama на сохранённой августовской валидации.
+r"""Проверяет импортированную модель Ollama на сохранённой отложенной выборке.
 
 Без параметров выбирает единственный импортированный профиль RTX4070/RTX3090Ti.
 Сверяет исходную разметку по SHA-256, восстанавливает временное разделение
@@ -6,7 +6,8 @@ r"""Проверяет импортированную модель Ollama на �
 В Ollama отправляет только заголовок, инструмент и горизонт. Считает MAE,
 ошибки JSON, совпадение балла и знака; сравнивает с нулём и адаптером.
 По умолчанию проверяет первые 32 сохранённых примера; --limit 0 — все.
-Сентябрь не использует. Проверяет качество баллов, а не доходность торговли.
+Сентябрь допускает только при явной роли test в манифесте обучения.
+Проверяет качество баллов/классов, а не доходность торговли.
 Перезаписывает check_model_report.json в каталоге обучения; файловых логов нет.
 Для задачи extremes вместо MAE считает precision/recall по трём классам
 и матрицу ошибок. Профили PROFILE_extremes поддерживаются отдельно от score.
@@ -17,6 +18,7 @@ r"""Проверяет импортированную модель Ollama на �
   .\.venv\Scripts\python.exe tests/experiments_-10_10/check_model.py --run data/experiments_-10_10/RTX3090Ti
   .\.venv\Scripts\python.exe tests/experiments_-10_10/check_model.py --prepare-only
   .\.venv\Scripts\python.exe tests/experiments_-10_10/check_model.py --run data/experiments_-10_10/RTX4070_extremes --limit 0
+  .\.venv\Scripts\python.exe tests/experiments_-10_10/check_model.py --run data/experiments_-10_10/RTX4070_extremes_test_202609 --data data/experiments_-10_10/scores_test_202609.jsonl --limit 0
 Параметры --name и --host выбирают модель и сервер; --data задаёт перенесённую
 разметку с тем же SHA-256. --prepare-only проверяет данные без вызовов Ollama.
 """
@@ -71,18 +73,17 @@ def predict(host, name, row, system_prompt, task='score'):
 
 
 def prepare_cases(run, data, limit):
-    """Проверяет run и SHA разметки data; возвращает выбранные валидационные строки и манифест."""
+    """Проверяет run, роль периода и SHA data; возвращает сохранённые отложенные строки и манифест."""
     manifest = json.loads((run / 'training_manifest.json').read_text(encoding='utf-8'))
     task_name(manifest)
     report = json.loads((run / 'data_report.json').read_text(encoding='utf-8'))
     if ollama.sha256_file(data) != report['data_sha256']:
         raise ValueError('Разметка отличается от обучения по SHA-256; требуется исходный файл')
     parameters = manifest['parameters']
+    training.validate_evaluation_period(parameters)
     rows, _ = training.read_examples(data)
     _, valid, _ = training.split_examples(rows, parameters['train_start'],
                                          parameters['validation_start'], parameters['cutoff'])
-    if training.parse_time(parameters['cutoff']) > training.parse_time('2026-09-01'):
-        raise ValueError('Эта проверка допускает только валидацию до сентября 2026')
     indexed = {(r['news_id'], r['instrument'], r['horizon']): r for r in valid}
     saved = json.loads((run / 'validation_predictions.json').read_text(encoding='utf-8'))
     selected, seen = [], set()
@@ -161,7 +162,9 @@ def main(argv=None):
         groups = {f'{i}_{h}': metric_function([p for p in predictions if p['instrument'] == i and p['horizon'] == h])
                   for i in ('MIX', 'RTS') for h in training.HORIZONS
                   if any(p['instrument'] == i and p['horizon'] == h for p in predictions)}
-        report = dict(ollama_name=name, host=host, task=task, model_identity_verified=False,
+        report = dict(ollama_name=name, host=host, task=task,
+                      evaluation_role=manifest['parameters'].get('evaluation_role', 'validation'),
+                      model_identity_verified=False,
                       note='Проверяется модель под указанным именем; её веса могли быть заменены после импорта.',
                       data_sha256=ollama.sha256_file(args.data),
                       period={k: manifest['parameters'][k] for k in ('validation_start', 'cutoff')},

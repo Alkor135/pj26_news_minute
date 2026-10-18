@@ -12,6 +12,9 @@ train_RTX4070.py с --task extremes, 5 — export_ollama.py, 6 — import_ollama
 --delete-labels перед этапом 3 удаляет только выбранный JSONL и его
 файл STEM_summary.json. Без этапа 3 этот флаг запрещён. Отсутствующие файлы
 пропускаются; папки не удаляются. При --dry-run файлы сохраняются.
+--final-test обучает на сентябре 2025 — августе 2026 и проверяет только
+после обучения на сентябре 2026. Использует отдельные JSONL, каталог и имя
+с суффиксом test_202609/test-202609. По умолчанию остаётся августовская валидация.
 
 Запуск в подготовленном .venv из корня проекта или кнопкой VS Code:
   .\.venv\Scripts\python.exe experiments_-10_10/orchestrator_RTX4070.py --dry-run
@@ -23,6 +26,8 @@ train_RTX4070.py с --task extremes, 5 — export_ollama.py, 6 — import_ollama
   .\.venv\Scripts\python.exe experiments_-10_10/orchestrator_RTX4070.py --from-stage 5
   .\.venv\Scripts\python.exe experiments_-10_10/orchestrator_RTX4070.py --from-stage 7
   .\.venv\Scripts\python.exe experiments_-10_10/orchestrator_RTX4070.py --from-stage 8
+  .\.venv\Scripts\python.exe experiments_-10_10/orchestrator_RTX4070.py --final-test --dry-run
+  .\.venv\Scripts\python.exe experiments_-10_10/orchestrator_RTX4070.py --final-test
 --data меняет путь JSONL, --run — единый каталог нового обучения,
 --reaction-db — готовую базу реакций для этапа 3, --name — имя новой модели.
 --dry-run только печатает команды и ничего не запускает.
@@ -44,11 +49,12 @@ def build_parser():
     parser.add_argument('--from-stage', type=int, choices=range(3, 9), default=3,
                         help='Первый этап; 3 — разметка, 4 — обучение, 5 — экспорт, 6 — импорт, 7 — проверка, 8 — HTML')
     parser.add_argument('--to-stage', type=int, choices=range(3, 9), default=8, help='Последний этап включительно')
-    parser.add_argument('--data', type=Path, default=ROOT / 'data/experiments_-10_10/scores.jsonl', help='JSONL разметки')
-    parser.add_argument('--run', type=Path, default=ROOT / 'data/experiments_-10_10/RTX4070_extremes',
+    parser.add_argument('--final-test', action='store_true', help='Полный год обучения до 01.09.2026; финальный тест за сентябрь 2026')
+    parser.add_argument('--data', type=Path, help='JSONL; по умолчанию scores.jsonl либо scores_test_202609.jsonl')
+    parser.add_argument('--run', type=Path,
                         help='Каталог нового обучения, экспорта и отчётов')
     parser.add_argument('--reaction-db', type=Path, help='Готовая база реакций вместо чтения тиков на этапе 3')
-    parser.add_argument('--name', default='news-extremes-4070', help='Имя модели при импорте и проверке')
+    parser.add_argument('--name', help='Имя модели; по умолчанию news-extremes-4070 либо news-extremes-4070-test-202609')
     parser.add_argument('--replace', action='store_true', help='Разрешить замену существующего имени модели при импорте')
     parser.add_argument('--delete-labels', action='store_true',
                         help='Перед этапом 3 удалить выбранный JSONL разметки и его сводку')
@@ -56,19 +62,37 @@ def build_parser():
     return parser
 
 
+def resolve_profile(args):
+    """Возвращает копию args с путями и периодом профиля; явные пути/имя сохраняет."""
+    resolved = argparse.Namespace(**vars(args))
+    base = ROOT / 'data/experiments_-10_10'
+    resolved.data = args.data or base / ('scores_test_202609.jsonl' if args.final_test else 'scores.jsonl')
+    resolved.run = args.run or base / ('RTX4070_extremes_test_202609' if args.final_test else 'RTX4070_extremes')
+    resolved.name = args.name or ('news-extremes-4070-test-202609' if args.final_test else 'news-extremes-4070')
+    resolved.train_start = '2025-09-01'
+    resolved.validation_start = '2026-09-01' if args.final_test else '2026-08-01'
+    resolved.cutoff = '2026-10-01' if args.final_test else '2026-09-01'
+    resolved.evaluation_role = 'test' if args.final_test else 'validation'
+    return resolved
+
+
 def build_commands(args):
-    """Возвращает список (номер, название, команда) для диапазона этапов args."""
+    """Возвращает список (номер, название, команда) для периода и этапов args."""
+    args = resolve_profile(args)
     if args.from_stage > args.to_stage:
         raise ValueError('--from-stage не должен превышать --to-stage')
     if args.delete_labels and args.from_stage != 3:
         raise ValueError('--delete-labels разрешён только при запуске этапа 3 (разметка)')
     run = args.run.resolve()
     data = args.data.resolve()
-    label = [sys.executable, str(SCRIPTS / 'build_rasmetka.py'), '--output', str(data)]
+    label = [sys.executable, str(SCRIPTS / 'build_rasmetka.py'), '--output', str(data),
+             '--start', args.train_start, '--end-exclusive', args.cutoff]
     if args.reaction_db:
         label.extend(['--reaction-db', str(args.reaction_db.resolve())])
     train = [sys.executable, str(SCRIPTS / 'train_RTX4070.py'), '--task', 'extremes',
-             '--data', str(data), '--output', str(run)]
+             '--data', str(data), '--output', str(run), '--train-start', args.train_start,
+             '--validation-start', args.validation_start, '--cutoff', args.cutoff,
+             '--evaluation-role', args.evaluation_role]
     export = [sys.executable, str(SCRIPTS / 'export_ollama.py'), '--run', str(run)]
     importer = [sys.executable, str(SCRIPTS / 'import_ollama.py'), '--export', str(run / 'export'),
                 '--name', args.name]
@@ -107,7 +131,7 @@ def main(argv=None):
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, 'reconfigure'):
             stream.reconfigure(encoding='utf-8')
-    args = build_parser().parse_args(argv)
+    args = resolve_profile(build_parser().parse_args(argv))
     try:
         commands = build_commands(args)
         stages = {stage for stage, _, _ in commands}

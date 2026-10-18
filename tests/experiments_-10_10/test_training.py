@@ -3,6 +3,7 @@
 Создаёт временные JSONL только внутри tests; тяжёлые библиотеки и GPU не нужны.
 Проверяет также выбор результата разметки по умолчанию для обоих профилей.
 Прежний числовой режим запускается с явным --task score.
+Проверяет явное отделение финального сентября от валидации.
 Общий модуль загружается из experiments_-10_10/source/training_common.py.
 Запуск из корня: python -m unittest discover -s tests/experiments_-10_10 -v.
 """
@@ -91,6 +92,21 @@ class TrainingTests(unittest.TestCase):
         self.assertEqual([r['news_id'] for r in valid], ['valid'])
         self.assertEqual(stats['purged_window_rows'], 2)
         self.assertEqual(stats['outside_period_rows'], 1)
+
+    def test_final_test_trains_on_august_and_tests_on_september(self):
+        """Новые границы включают август в обучение, сентябрь только в итоговую проверку."""
+        rows, _ = self.read([
+            example('august', '2026-08-15 10:00:00', '2026-08-15 10:05:01'),
+            example('september', '2026-09-15 10:00:00', '2026-09-15 10:05:01'),
+            example('october', '2026-10-01 10:00:00', '2026-10-01 10:05:01'),
+        ])
+        train, test, _ = self.module.split_examples(rows, '2025-09-01', '2026-09-01', '2026-10-01')
+        self.assertEqual([r['news_id'] for r in train], ['august'])
+        self.assertEqual([r['news_id'] for r in test], ['september'])
+        parameters = dict(validation_start='2026-09-01', cutoff='2026-10-01', evaluation_role='test')
+        self.assertEqual(self.module.validate_evaluation_period(parameters), 'test')
+        with self.assertRaisesRegex(ValueError, 'test'):
+            self.module.validate_evaluation_period(parameters | {'evaluation_role': 'validation'})
 
     def test_reprints_not_shared_between_train_and_validation(self):
         """Убирает из обучения перепечатки по нормализованному заголовку и group_id."""

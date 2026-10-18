@@ -3,6 +3,7 @@ r"""Проверяет порядок этапов оркестратора RTX 
 Все подмены ограничены внешними процессами. Временные файлы только в tests.
 Проверяет реальное удаление только выбранной разметки и её сводки во временной папке.
 Последний этап 8 формирует HTML из готового отчёта без обращения к модели.
+Режим final-test использует полный год обучения и сентябрь 2026 только для итоговой проверки.
 Запуск: .\.venv\Scripts\python.exe -m unittest discover -s tests/experiments_-10_10 -p test_orchestrator.py -v
 """
 
@@ -42,6 +43,27 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(commands[4][2][-2:], ['--limit', '0'])
         self.assertIn('build_html_report.py', commands[5][2][1])
         self.assertIn(str(self.run), commands[5][2])
+
+    def test_final_test_has_separate_paths_and_september_boundaries(self):
+        """Финальный профиль переносит август в обучение и не меняет старые каталоги."""
+        args = self.module.build_parser().parse_args(['--final-test'])
+        commands = self.module.build_commands(args)
+        label = commands[0][2]
+        train = commands[1][2]
+        self.assertEqual(label[label.index('--end-exclusive') + 1], '2026-10-01')
+        self.assertEqual(train[train.index('--validation-start') + 1], '2026-09-01')
+        self.assertEqual(train[train.index('--cutoff') + 1], '2026-10-01')
+        self.assertEqual(train[train.index('--evaluation-role') + 1], 'test')
+        self.assertIn('scores_test_202609.jsonl', label[label.index('--output') + 1])
+        self.assertTrue(train[train.index('--output') + 1].endswith('RTX4070_extremes_test_202609'))
+        self.assertIn('news-extremes-4070-test-202609', commands[3][2])
+
+    def test_final_test_preserves_explicit_output(self):
+        """Явные пути и имя имеют приоритет над отдельными каталогами финального профиля."""
+        args = self.module.build_parser().parse_args(['--final-test', '--run', str(self.run), '--name', 'custom-test'])
+        commands = self.module.build_commands(args)
+        self.assertIn(str(self.run), commands[1][2])
+        self.assertIn('custom-test', commands[3][2])
 
     def test_dry_run_does_not_start_processes(self):
         """Просмотр команд работает без данных, CUDA и Ollama."""

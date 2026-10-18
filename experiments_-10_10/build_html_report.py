@@ -6,6 +6,7 @@ r"""Создаёт автономный HTML-отчёт из готовой пр
 Добавляет вывод о готовности к реальной торговле и для ложных сигналов
 направление, цены и условный результат в пунктах без издержек. Пункты берёт
 из разметки, а не из балла; короткий сигнал меняет знак движения цены.
+Показывает роль evaluation_role: валидация либо отдельный финальный тест.
 Окружение обучения, GPU, Ollama и интернет не требуются; модель не запускается.
 По умолчанию RUN=data/experiments_-10_10/RTX4070_extremes от корня проекта.
 Перезаписывает RUN/check_model_report.html; исходные JSON/разметку не меняет.
@@ -157,6 +158,7 @@ def render_report(report, news, warning):
     conclusion += f' Выдано {metrics["signal_count"]} экстремальных сигналов, из них ложных — {false}.'
     model = escape(str(report.get('ollama_name', 'Не указана')))
     period = report.get('period', {})
+    role = 'Финальный тест' if report.get('evaluation_role') == 'test' else 'Валидация'
     dates = escape(f'{period.get("validation_start", "—")} → {period.get("cutoff", "—")} (конец не включён)')
     class_table = table(['Фактический класс', 'В выборке', 'Сигналов', 'Верных', 'Ложных', 'Пропущено', 'Точность', 'Полнота', 'F1'], [
         [class_badge(c), str(classes[c]['support']), str(classes[c]['predicted_count']),
@@ -262,7 +264,7 @@ def render_report(report, news, warning):
     data_hash = escape(str(report.get('data_sha256', 'Не указан')))
     return PAGE.replace('@@BODY@@', f'''
 <header><p class="eyebrow">ЭКСПЕРИМЕНТ · НОВОСТИ → MIX / RTS</p><h1>Проверка экстремальных реакций</h1>
-<p class="subtitle">{model} · {dates}</p></header>
+<p class="subtitle">{model} · {role} · {dates}</p></header>
 <section class="trade-verdict"><h2>Можно использовать для торговли?</h2>
 <p><b>Пока нет. Готовность к реальной торговле не подтверждена.</b> В текущем отчёте нет полноценной
 проверки торговой стратегии с издержками и исполнением. Это не утверждение об убыточности:
