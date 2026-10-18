@@ -1,6 +1,8 @@
 r"""Проверяет защиту экспорта и импорта модели без загрузки больших весов.
 
 Создаёт временные учебные артефакты только внутри tests.
+Проверяет также запуск экспорта без параметров и неоднозначный выбор обучения.
+Для импорта проверяет выбор экспорта без параметров и отказ при неоднозначности.
 Запуск: .\.venv\Scripts\python.exe -m unittest discover -s tests/experiments_-10_10 -v
 """
 
@@ -65,6 +67,37 @@ class OllamaTransferTests(unittest.TestCase):
         run = self.training_run(adapter_base='Qwen/Another-Model')
         with self.assertRaisesRegex(ValueError, '(?i)базов'):
             self.export.validate_training_run(run)
+
+    def test_export_without_run_selects_only_finished_profile(self):
+        """Запуск без --run находит единственное завершённое обучение обоих профилей."""
+        run = self.training_run()
+        directory = self.root / 'data' / 'experiments_-10_10'
+        directory.mkdir(parents=True)
+        run.rename(directory / run.name)
+        (directory / 'RTX4070').mkdir()
+        with patch.object(self.export, 'ROOT', self.root):
+            args = self.export.build_parser().parse_args(['--check-only'])
+            self.assertIsNone(self.export.export_run(args))
+            self.assertEqual(args.llama_cpp_dir, directory / 'llama.cpp')
+
+    def test_export_without_run_rejects_two_finished_profiles(self):
+        """Два завершённых профиля требуют явного --run вместо молчаливого выбора."""
+        directory = self.root / 'data' / 'experiments_-10_10'
+        for profile in ('RTX4070', 'RTX3090Ti'):
+            run = directory / profile
+            run.mkdir(parents=True)
+            (run / 'adapter_provenance.json').write_text('{}', encoding='utf-8')
+        with patch.object(self.export, 'ROOT', self.root):
+            args = self.export.build_parser().parse_args(['--check-only'])
+            with self.assertRaisesRegex(ValueError, 'оба.*--run'):
+                self.export.export_run(args)
+
+    def test_export_without_run_reports_missing_training(self):
+        """Без завершённого обучения выводится объяснение с параметром --run."""
+        with patch.object(self.export, 'ROOT', self.root):
+            args = self.export.build_parser().parse_args(['--check-only'])
+            with self.assertRaisesRegex(ValueError, 'завершён.*--run'):
+                self.export.export_run(args)
 
     def test_export_requires_finished_adapter(self):
         """Один манифест без обученных весов не считается результатом обучения."""
@@ -228,6 +261,44 @@ class OllamaTransferTests(unittest.TestCase):
         report = json.loads((folder / 'import_report.json').read_text(encoding='utf-8'))
         self.assertEqual(report['smoke_test']['score'], -3)
         self.assertEqual(report['smoke_test']['status'], 'passed')
+
+    def test_import_without_export_selects_single_profile(self):
+        """Каждый профиль автоматически выбирается и проверяется без обращения к Ollama."""
+        for profile, name in self.importer.DEFAULT_NAMES.items():
+            with self.subTest(profile=profile):
+                folder = self.root / 'data' / 'experiments_-10_10' / profile / 'export'
+                folder.mkdir(parents=True)
+                gguf = folder / 'model-Q4_K_M.gguf'
+                gguf.write_bytes(b'GGUFexample')
+                manifest = folder / 'export_manifest.json'
+                manifest.write_text(json.dumps({
+                    'profile': profile, 'model': 'Qwen/Example', 'revision': 'a' * 40,
+                    'system_prompt': 'Верни только JSON.', 'gguf_file': gguf.name,
+                    'gguf_sha256': hashlib.sha256(gguf.read_bytes()).hexdigest()
+                }), encoding='utf-8')
+                with patch.object(self.importer, 'ROOT', self.root):
+                    args = self.importer.build_parser().parse_args(['--check-only'])
+                    self.assertEqual(self.importer.import_model(args), name)
+                self.assertFalse((folder / 'Modelfile').exists())
+                manifest.unlink()
+
+    def test_import_without_export_rejects_ambiguity(self):
+        """Два манифеста экспорта требуют явного --export."""
+        for profile in ('RTX4070', 'RTX3090Ti'):
+            folder = self.root / 'data' / 'experiments_-10_10' / profile / 'export'
+            folder.mkdir(parents=True)
+            (folder / 'export_manifest.json').write_text('{}', encoding='utf-8')
+        with patch.object(self.importer, 'ROOT', self.root, create=True):
+            args = self.importer.build_parser().parse_args(['--check-only'])
+            with self.assertRaisesRegex(ValueError, 'оба.*--export'):
+                self.importer.import_model(args)
+
+    def test_import_without_export_reports_missing_export(self):
+        """Отсутствие экспорта объясняется без запуска CLI Ollama."""
+        with patch.object(self.importer, 'ROOT', self.root, create=True):
+            args = self.importer.build_parser().parse_args(['--check-only'])
+            with self.assertRaisesRegex(ValueError, 'экспорт.*--export'):
+                self.importer.import_model(args)
 
 
 if __name__ == '__main__':

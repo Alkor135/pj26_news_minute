@@ -6,8 +6,13 @@ llama.cpp в F16 GGUF и квантует до Q4_K_M (или выбранног
 Результат записывается в новую папку export вместе с манифестом и SHA-256.
 Незавершённый результат обучения и уже существующий каталог экспорта не меняет.
 Использует общее .venv с зависимостями из корневого requirements.txt.
+Без --run выбирает единственный профиль RTX4070/RTX3090Ti с отметкой
+завершения в data/experiments_-10_10 относительно корня проекта.
+Если таких профилей нет или готовы оба, требует явный --run.
+Путь llama.cpp по умолчанию: data/experiments_-10_10/llama.cpp.
 
 Примеры запуска из корня проекта:
+  .\.venv\Scripts\python.exe experiments_-10_10/export_ollama.py
   .\.venv\Scripts\python.exe experiments_-10_10/export_ollama.py --run data/experiments_-10_10/RTX4070 --llama-cpp-dir data/experiments_-10_10/llama.cpp
   .\.venv\Scripts\python.exe experiments_-10_10/export_ollama.py --run data/experiments_-10_10/RTX3090Ti --llama-cpp-dir data/experiments_-10_10/llama.cpp --device cuda:0
   .\.venv\Scripts\python.exe experiments_-10_10/export_ollama.py --run data/experiments_-10_10/RTX4070 --check-only
@@ -177,8 +182,21 @@ def convert_and_quantize(merged, converter, quantizer, folder, quantization, con
 
 
 def export_run(args):
-    """Проводит полный экспорт по args и возвращает путь итогового каталога."""
-    run = args.run.resolve()
+    """Выбирает обучение из args или единственный готовый профиль; возвращает каталог экспорта."""
+    if args.run is None:
+        directory = ROOT / 'data' / 'experiments_-10_10'
+        candidates = [directory / profile for profile in ('RTX4070', 'RTX3090Ti')
+                      if (directory / profile / 'adapter_provenance.json').is_file()]
+        if not candidates:
+            raise ValueError('Не найдено завершённое обучение RTX4070/RTX3090Ti; '
+                             'завершите обучение или задайте --run ПУТЬ')
+        if len(candidates) > 1:
+            raise ValueError('Найдены оба завершённых профиля; задайте --run ПУТЬ: '
+                             + ', '.join(str(path) for path in candidates))
+        run = candidates[0].resolve()
+        print(f'Автоматически выбран результат обучения: {run}', flush=True)
+    else:
+        run = args.run.resolve()
     manifest = validate_training_run(run)
     output = (args.output or run / 'export').resolve()
     if args.check_only:
@@ -218,11 +236,14 @@ def export_run(args):
 
 
 def build_parser():
-    """Создаёт парсер аргументов для проверки и экспорта обученного запуска."""
+    """Возвращает парсер экспорта с автоматическим выбором обучения и стандартным llama.cpp."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument('--run', required=True, type=Path, help='Папка результата обучения RTX4070 или RTX3090Ti')
+    parser.add_argument('--run', type=Path,
+                        help='Папка обучения; по умолчанию единственный завершённый профиль RTX4070/RTX3090Ti')
     parser.add_argument('--output', type=Path, help='Новая папка результата; по умолчанию RUN/export')
-    parser.add_argument('--llama-cpp-dir', type=Path, help='Папка исходников и сборки llama.cpp')
+    parser.add_argument('--llama-cpp-dir', type=Path,
+                        default=ROOT / 'data' / 'experiments_-10_10' / 'llama.cpp',
+                        help='Папка llama.cpp; по умолчанию data/experiments_-10_10/llama.cpp в проекте')
     parser.add_argument('--converter', type=Path, help='Путь к convert_hf_to_gguf.py вместо --llama-cpp-dir')
     parser.add_argument('--converter-python', default=sys.executable,
                         help='Python с зависимостями llama.cpp; по умолчанию текущий Python')

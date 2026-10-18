@@ -4,8 +4,12 @@ r"""Регистрирует проверенный GGUF-экспорт как �
 заданием обучения, вызывает ollama create и проверяет ответ через /api/chat.
 Существующее имя модели не заменяет без явного --replace. Пробный запрос
 проверяет JSON с одним целым score в диапазоне от -10 до +10.
+Без --export выбирает единственную папку export с export_manifest.json
+среди профилей RTX4070 и RTX3090Ti в data/experiments_-10_10 относительно
+корня проекта. Если нет ни одной или найдены обе, требует явный --export.
 
 Примеры запуска из корня проекта:
+  .\.venv\Scripts\python.exe experiments_-10_10/import_ollama.py
   .\.venv\Scripts\python.exe experiments_-10_10/import_ollama.py --export data/experiments_-10_10/RTX4070/export
   .\.venv\Scripts\python.exe experiments_-10_10/import_ollama.py --export data/experiments_-10_10/RTX3090Ti/export --name news-score-3090ti
   .\.venv\Scripts\python.exe experiments_-10_10/import_ollama.py --export data/experiments_-10_10/RTX4070/export --check-only
@@ -23,6 +27,7 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 
 
+ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_NAMES = {'RTX4070': 'news-score-4070', 'RTX3090Ti': 'news-score-3090ti'}
 
 
@@ -129,8 +134,21 @@ def smoke_test(host, name):
 
 
 def import_model(args):
-    """Проверяет экспорт, создаёт модель по args и возвращает её имя."""
-    folder = args.export.resolve()
+    """Выбирает и проверяет экспорт по args, создаёт модель и возвращает её имя."""
+    if args.export is None:
+        directory = ROOT / 'data' / 'experiments_-10_10'
+        candidates = [directory / profile / 'export' for profile in DEFAULT_NAMES
+                      if (directory / profile / 'export' / 'export_manifest.json').is_file()]
+        if not candidates:
+            raise ValueError('Не найден экспорт RTX4070/RTX3090Ti; выполните export_ollama.py '
+                             'или задайте --export ПУТЬ')
+        if len(candidates) > 1:
+            raise ValueError('Найдены оба экспорта; задайте --export ПУТЬ: '
+                             + ', '.join(str(path) for path in candidates))
+        folder = candidates[0].resolve()
+        print(f'Автоматически выбрана папка экспорта: {folder}', flush=True)
+    else:
+        folder = args.export.resolve()
     manifest, gguf = validate_export(folder)
     name = args.name or DEFAULT_NAMES[manifest['profile']]
     if not re.fullmatch(r'[a-z0-9][a-z0-9._/-]*(?::[a-z0-9._-]+)?', name):
@@ -169,9 +187,10 @@ def import_model(args):
 
 
 def build_parser():
-    """Создаёт парсер командной строки для импорта и проверки GGUF."""
+    """Возвращает парсер импорта GGUF с автоматическим выбором единственного экспорта."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument('--export', required=True, type=Path, help='Папка с GGUF и export_manifest.json')
+    parser.add_argument('--export', type=Path,
+                        help='Папка GGUF; по умолчанию единственный экспорт профилей RTX4070/RTX3090Ti')
     parser.add_argument('--name', help='Имя новой модели; по умолчанию зависит от профиля GPU')
     parser.add_argument('--host', default='http://127.0.0.1:11434', help='Адрес локального Ollama API')
     parser.add_argument('--ollama', default='ollama', help='Команда или путь к ollama.exe')
