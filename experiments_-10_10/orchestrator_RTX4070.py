@@ -2,10 +2,11 @@ r"""Последовательно запускает эксперимент т�
 
 Этапы: 3 — build_rasmetka.py (загрузка RSS, фильтр, баллы), 4 — обучение
 train_RTX4070.py с --task extremes, 5 — export_ollama.py, 6 — import_ollama.py,
-7 — check_model.py на всей сохранённой валидации. Этап 4.1 (подготовка llama.cpp)
+7 — check_model.py на всей сохранённой валидации, 8 — build_html_report.py
+по готовым ответам. Этап 4.1 (подготовка llama.cpp)
 выполняется заранее по README. Каждый процесс запускается текущим Python
 из корня проекта. При первой ошибке следующие этапы не выполняются.
-Без параметров запускает этапы 3–7; этап 3 пересоздаёт файл разметки.
+Без параметров запускает этапы 3–8; этап 3 пересоздаёт файл разметки.
 Готовые обучение и экспорт не перезаписывает; замену модели Ollama разрешает
 только --replace. Прогресс выводится в консоль, файловых логов нет.
 --delete-labels перед этапом 3 удаляет только выбранный JSONL и его
@@ -21,6 +22,7 @@ train_RTX4070.py с --task extremes, 5 — export_ollama.py, 6 — import_ollama
   .\.venv\Scripts\python.exe experiments_-10_10/orchestrator_RTX4070.py --from-stage 4 --to-stage 4
   .\.venv\Scripts\python.exe experiments_-10_10/orchestrator_RTX4070.py --from-stage 5
   .\.venv\Scripts\python.exe experiments_-10_10/orchestrator_RTX4070.py --from-stage 7
+  .\.venv\Scripts\python.exe experiments_-10_10/orchestrator_RTX4070.py --from-stage 8
 --data меняет путь JSONL, --run — единый каталог нового обучения,
 --reaction-db — готовую базу реакций для этапа 3, --name — имя новой модели.
 --dry-run только печатает команды и ничего не запускает.
@@ -39,9 +41,9 @@ SCRIPTS = ROOT / 'experiments_-10_10'
 def build_parser():
     """Возвращает параметры диапазона этапов, общих путей и безопасного просмотра."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument('--from-stage', type=int, choices=range(3, 8), default=3,
-                        help='Первый этап; 3 — разметка, 4 — обучение, 5 — экспорт, 6 — импорт, 7 — проверка')
-    parser.add_argument('--to-stage', type=int, choices=range(3, 8), default=7, help='Последний этап включительно')
+    parser.add_argument('--from-stage', type=int, choices=range(3, 9), default=3,
+                        help='Первый этап; 3 — разметка, 4 — обучение, 5 — экспорт, 6 — импорт, 7 — проверка, 8 — HTML')
+    parser.add_argument('--to-stage', type=int, choices=range(3, 9), default=8, help='Последний этап включительно')
     parser.add_argument('--data', type=Path, default=ROOT / 'data/experiments_-10_10/scores.jsonl', help='JSONL разметки')
     parser.add_argument('--run', type=Path, default=ROOT / 'data/experiments_-10_10/RTX4070_extremes',
                         help='Каталог нового обучения, экспорта и отчётов')
@@ -74,9 +76,10 @@ def build_commands(args):
         importer.append('--replace')
     check = [sys.executable, str(ROOT / 'tests/experiments_-10_10/check_model.py'),
              '--run', str(run), '--data', str(data), '--name', args.name, '--limit', '0']
+    html = [sys.executable, str(SCRIPTS / 'build_html_report.py'), '--run', str(run), '--data', str(data)]
     commands = [(3, 'Разметка', label), (4, 'Обучение трёх классов', train),
                 (5, 'Объединение и экспорт GGUF', export), (6, 'Импорт в Ollama', importer),
-                (7, 'Проверка модели', check)]
+                (7, 'Проверка модели', check), (8, 'HTML-отчёт', html)]
     return [entry for entry in commands if args.from_stage <= entry[0] <= args.to_stage]
 
 

@@ -2,6 +2,7 @@ r"""Проверяет порядок этапов оркестратора RTX 
 
 Все подмены ограничены внешними процессами. Временные файлы только в tests.
 Проверяет реальное удаление только выбранной разметки и её сводки во временной папке.
+Последний этап 8 формирует HTML из готового отчёта без обращения к модели.
 Запуск: .\.venv\Scripts\python.exe -m unittest discover -s tests/experiments_-10_10 -p test_orchestrator.py -v
 """
 
@@ -33,18 +34,28 @@ class OrchestratorTests(unittest.TestCase):
         """Каждый этап получает один и тот же каталог; классификация выбирается явно."""
         args = self.module.build_parser().parse_args(['--run', str(self.run)])
         commands = self.module.build_commands(args)
-        self.assertEqual([stage for stage, _, _ in commands], [3, 4, 5, 6, 7])
+        self.assertEqual([stage for stage, _, _ in commands], [3, 4, 5, 6, 7, 8])
         self.assertIn('extremes', commands[1][2])
         self.assertIn(str(self.run), commands[1][2])
         self.assertIn(str(self.run), commands[2][2])
         self.assertIn(str(self.run / 'export'), commands[3][2])
         self.assertEqual(commands[4][2][-2:], ['--limit', '0'])
+        self.assertIn('build_html_report.py', commands[5][2][1])
+        self.assertIn(str(self.run), commands[5][2])
 
     def test_dry_run_does_not_start_processes(self):
         """Просмотр команд работает без данных, CUDA и Ollama."""
         with patch.object(self.module.subprocess, 'run') as execute:
             self.assertEqual(self.module.main(['--dry-run', '--run', str(self.run)]), 0)
         execute.assert_not_called()
+
+    def test_only_html_stage_does_not_run_model(self):
+        """Запуск с этапа 8 вызывает только создание отчёта."""
+        args = self.module.build_parser().parse_args(['--from-stage', '8', '--run', str(self.run)])
+        commands = self.module.build_commands(args)
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0][0], 8)
+        self.assertEqual(Path(commands[0][2][1]).name, 'build_html_report.py')
 
     def test_failure_stops_following_stages(self):
         """Ошибка импорта не допускает запуска проверки модели."""
