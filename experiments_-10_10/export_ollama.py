@@ -10,9 +10,12 @@ llama.cpp в F16 GGUF и квантует до Q4_K_M (или выбранног
 завершения в data/experiments_-10_10 относительно корня проекта.
 Если таких профилей нет или готовы оба, требует явный --run.
 Путь llama.cpp по умолчанию: data/experiments_-10_10/llama.cpp.
+Поддерживает score и extremes по манифесту; ищет также PROFILE_extremes.
+Задача и формат ответа передаются в export_manifest.json без смены типа модели.
 
 Примеры запуска из корня проекта:
   .\.venv\Scripts\python.exe experiments_-10_10/export_ollama.py
+  .\.venv\Scripts\python.exe experiments_-10_10/export_ollama.py --run data/experiments_-10_10/RTX4070_extremes
   .\.venv\Scripts\python.exe experiments_-10_10/export_ollama.py --run data/experiments_-10_10/RTX4070 --llama-cpp-dir data/experiments_-10_10/llama.cpp
   .\.venv\Scripts\python.exe experiments_-10_10/export_ollama.py --run data/experiments_-10_10/RTX3090Ti --llama-cpp-dir data/experiments_-10_10/llama.cpp --device cuda:0
   .\.venv\Scripts\python.exe experiments_-10_10/export_ollama.py --run data/experiments_-10_10/RTX4070 --check-only
@@ -29,6 +32,8 @@ import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent / 'source'))
+from model_tasks import parse_response, run_directories, task_name
 QUANTIZATIONS = ('Q4_K_M', 'Q5_K_M', 'Q8_0')
 
 
@@ -42,7 +47,7 @@ def sha256_file(path):
 
 
 def validate_training_run(run):
-    """Проверяет завершённый run и совместимость адаптера; возвращает манифест."""
+    """Проверяет завершённый run, задачу и совместимость адаптера; возвращает манифест."""
     run = Path(run)
     manifest_file = run / 'training_manifest.json'
     metrics_file = run / 'training_metrics.json'
@@ -60,6 +65,8 @@ def validate_training_run(run):
     adapter_config = json.loads((adapter / 'adapter_config.json').read_text(encoding='utf-8'))
     if any(not isinstance(item, dict) for item in (manifest, provenance, adapter_config)):
         raise ValueError('Манифест, отметка завершения и конфигурация адаптера должны быть объектами JSON')
+    if task_name(manifest) != task_name(provenance):
+        raise ValueError('Задача адаптера не совпадает с манифестом обучения')
     model = manifest.get('model')
     revision = manifest.get('revision')
     if not isinstance(model, str) or not model.strip():
@@ -110,8 +117,8 @@ def check_gguf(path):
     return path.stat().st_size
 
 
-def smoke_merged_model(model, tokenizer, system_prompt):
-    """Проверяет один ответ объединённой модели и возвращает отчёт о формате."""
+def smoke_merged_model(model, tokenizer, system_prompt, task='score'):
+    """Проверяет ответ модели по контракту task и возвращает отчёт о формате."""
     import torch
     payload = json.dumps({'title': 'Банк России повысил ключевую ставку',
                           'instrument': 'MIX', 'horizon_minutes': 5}, ensure_ascii=False)
@@ -126,13 +133,10 @@ def smoke_merged_model(model, tokenizer, system_prompt):
                                    pad_token_id=tokenizer.eos_token_id)
     answer = tokenizer.decode(generated[0, tokens.shape[-1]:], skip_special_tokens=True).strip()
     try:
-        result = json.loads(answer)
-        if (not isinstance(result, dict) or set(result) != {'score'}
-                or type(result['score']) is not int or not -10 <= result['score'] <= 10):
-            raise ValueError('ожидается ровно одно целое поле score от -10 до +10')
-    except (ValueError, json.JSONDecodeError) as error:
+        value = parse_response(answer, task)
+    except ValueError as error:
         return {'status': 'failed', 'answer': answer, 'error': str(error)}
-    return {'status': 'passed', 'answer': answer, 'score': result['score']}
+    return {'status': 'passed', 'answer': answer, 'class' if task == 'extremes' else 'score': value}
 
 
 def merge_adapter(run, manifest, target, device):
@@ -157,7 +161,7 @@ def merge_adapter(run, manifest, target, device):
     merged.save_pretrained(target, safe_serialization=True, max_shard_size='4GB')
     tokenizer = AutoTokenizer.from_pretrained(Path(run) / 'adapter')
     tokenizer.save_pretrained(target)
-    smoke = smoke_merged_model(merged, tokenizer, manifest['system_prompt'])
+    smoke = smoke_merged_model(merged, tokenizer, manifest['system_prompt'], task_name(manifest))
     if smoke['status'] != 'passed':
         print(f'Предупреждение: пробный ответ объединённой модели неверен: {smoke["error"]}',
               file=sys.stderr)
@@ -185,13 +189,13 @@ def export_run(args):
     """Выбирает обучение из args или единственный готовый профиль; возвращает каталог экспорта."""
     if args.run is None:
         directory = ROOT / 'data' / 'experiments_-10_10'
-        candidates = [directory / profile for profile in ('RTX4070', 'RTX3090Ti')
-                      if (directory / profile / 'adapter_provenance.json').is_file()]
+        candidates = [path for path in run_directories(directory)
+                      if (path / 'adapter_provenance.json').is_file()]
         if not candidates:
             raise ValueError('Не найдено завершённое обучение RTX4070/RTX3090Ti; '
                              'завершите обучение или задайте --run ПУТЬ')
         if len(candidates) > 1:
-            raise ValueError('Найдены оба завершённых профиля; задайте --run ПУТЬ: '
+            raise ValueError('Найдены оба или несколько завершённых профилей; задайте --run ПУТЬ: '
                              + ', '.join(str(path) for path in candidates))
         run = candidates[0].resolve()
         print(f'Автоматически выбран результат обучения: {run}', flush=True)
@@ -216,6 +220,7 @@ def export_run(args):
                                     args.converter_python)
         report = {
             'profile': manifest['profile'], 'model': manifest['model'],
+            'task': task_name(manifest),
             'revision': manifest['revision'], 'system_prompt': manifest['system_prompt'],
             'training_manifest_sha256': sha256_file(run / 'training_manifest.json'),
             'adapter_sha256': sha256_file(run / 'adapter' / 'adapter_model.safetensors'),

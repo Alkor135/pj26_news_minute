@@ -7,9 +7,12 @@ r"""Регистрирует проверенный GGUF-экспорт как �
 Без --export выбирает единственную папку export с export_manifest.json
 среди профилей RTX4070 и RTX3090Ti в data/experiments_-10_10 относительно
 корня проекта. Если нет ни одной или найдены обе, требует явный --export.
+Поддерживает PROFILE_extremes; для extremes проверяет JSON с полем class
+и создаёт отдельное имя news-extremes-4070 либо news-extremes-3090ti.
 
 Примеры запуска из корня проекта:
   .\.venv\Scripts\python.exe experiments_-10_10/import_ollama.py
+  .\.venv\Scripts\python.exe experiments_-10_10/import_ollama.py --export data/experiments_-10_10/RTX4070_extremes/export
   .\.venv\Scripts\python.exe experiments_-10_10/import_ollama.py --export data/experiments_-10_10/RTX4070/export
   .\.venv\Scripts\python.exe experiments_-10_10/import_ollama.py --export data/experiments_-10_10/RTX3090Ti/export --name news-score-3090ti
   .\.venv\Scripts\python.exe experiments_-10_10/import_ollama.py --export data/experiments_-10_10/RTX4070/export --check-only
@@ -28,6 +31,8 @@ from urllib import request as urlrequest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent / 'source'))
+from model_tasks import parse_response, run_directories, task_name
 DEFAULT_NAMES = {'RTX4070': 'news-score-4070', 'RTX3090Ti': 'news-score-3090ti'}
 
 
@@ -41,7 +46,7 @@ def sha256_file(path):
 
 
 def validate_export(folder):
-    """Проверяет folder и целостность GGUF; возвращает манифест и путь к весам."""
+    """Проверяет задачу, folder и целостность GGUF; возвращает манифест и путь к весам."""
     folder = Path(folder).resolve()
     source = folder / 'export_manifest.json'
     if not source.is_file():
@@ -49,6 +54,7 @@ def validate_export(folder):
     manifest = json.loads(source.read_text(encoding='utf-8'))
     if not isinstance(manifest, dict):
         raise ValueError('Манифест экспорта должен быть объектом JSON')
+    task_name(manifest)
     if manifest.get('profile') not in DEFAULT_NAMES:
         raise ValueError('Неизвестный профиль модели')
     if not isinstance(manifest.get('model'), str) or not manifest['model'].strip():
@@ -119,8 +125,8 @@ def existing_models(host):
     return {str(item['name']) for item in data['models'] if isinstance(item, dict) and 'name' in item}
 
 
-def smoke_test(host, name):
-    """Отправляет тестовый запрос модели name и возвращает ответ и проверенный score."""
+def smoke_test(host, name, task='score'):
+    """Запрашивает модель name на host и возвращает текст и значение по контракту task."""
     message = json.dumps({'title': 'Банк России повысил ключевую ставку',
                           'instrument': 'MIX', 'horizon_minutes': 5}, ensure_ascii=False)
     response = api_json(host, '/api/chat', {
@@ -130,27 +136,29 @@ def smoke_test(host, name):
     if not isinstance(response, dict) or not isinstance(response.get('message'), dict):
         raise RuntimeError('Ollama вернула неверную структуру /api/chat')
     answer = response['message'].get('content')
-    return answer, parse_score(answer)
+    return answer, parse_response(answer, task)
 
 
 def import_model(args):
     """Выбирает и проверяет экспорт по args, создаёт модель и возвращает её имя."""
     if args.export is None:
         directory = ROOT / 'data' / 'experiments_-10_10'
-        candidates = [directory / profile / 'export' for profile in DEFAULT_NAMES
-                      if (directory / profile / 'export' / 'export_manifest.json').is_file()]
+        candidates = [path / 'export' for path in run_directories(directory)
+                      if (path / 'export' / 'export_manifest.json').is_file()]
         if not candidates:
             raise ValueError('Не найден экспорт RTX4070/RTX3090Ti; выполните export_ollama.py '
                              'или задайте --export ПУТЬ')
         if len(candidates) > 1:
-            raise ValueError('Найдены оба экспорта; задайте --export ПУТЬ: '
+            raise ValueError('Найдены оба или несколько экспортов; задайте --export ПУТЬ: '
                              + ', '.join(str(path) for path in candidates))
         folder = candidates[0].resolve()
         print(f'Автоматически выбрана папка экспорта: {folder}', flush=True)
     else:
         folder = args.export.resolve()
     manifest, gguf = validate_export(folder)
-    name = args.name or DEFAULT_NAMES[manifest['profile']]
+    task = task_name(manifest)
+    default_name = DEFAULT_NAMES[manifest['profile']]
+    name = args.name or (default_name.replace('news-score-', 'news-extremes-') if task == 'extremes' else default_name)
     if not re.fullmatch(r'[a-z0-9][a-z0-9._/-]*(?::[a-z0-9._-]+)?', name):
         raise ValueError('Некорректное имя модели Ollama')
     modelfile = build_modelfile(gguf, manifest['system_prompt'])
@@ -172,15 +180,15 @@ def import_model(args):
     if name not in existing_models(args.host) and canonical not in existing_models(args.host):
         raise RuntimeError('После ollama create модель не найдена в /api/tags')
     report = {'ollama_name': name, 'profile': manifest['profile'],
-              'gguf_sha256': manifest['gguf_sha256'], 'host': args.host}
+              'task': task, 'gguf_sha256': manifest['gguf_sha256'], 'host': args.host}
     try:
-        answer, score = smoke_test(args.host, name)
+        answer, value = smoke_test(args.host, name, task)
     except (ValueError, RuntimeError) as error:
         report['smoke_test'] = {'status': 'failed', 'error': str(error)}
         (folder / 'import_report.json').write_text(
             json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
         raise RuntimeError(f'Модель создана, но пробный ответ неверен: {error}') from error
-    report['smoke_test'] = {'status': 'passed', 'score': score, 'answer': answer}
+    report['smoke_test'] = {'status': 'passed', 'class' if task == 'extremes' else 'score': value, 'answer': answer}
     (folder / 'import_report.json').write_text(
         json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     return name

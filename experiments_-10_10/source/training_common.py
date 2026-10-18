@@ -1,4 +1,4 @@
-"""Общая подготовка данных и QLoRA-обучение модели оценке реакции −10…+10.
+"""Общая подготовка данных и QLoRA-обучение классов реакции либо балла −10…+10.
 
 Читает готовую разметку CSV/JSONL, проверяет метки, делит историю по времени,
 исключает пересекающиеся окна и перепечатки. На вход модели передаются только
@@ -9,10 +9,14 @@
 завершения, которую проверяет последующий экспорт в Ollama.
 Файловые логи не создаются; ход работы выводится в консоль.
 Обучение запускается в общем .venv проекта с зависимостями из корневого requirements.txt.
+По умолчанию task=extremes: баллы ±8…±10 преобразуются в negative/positive,
+остальные — в none. Балансируется только обучение после временного разделения.
+Результаты сохраняются в PROFILE_extremes; --task score сохраняет прежнюю задачу.
 
 Запуск из корня через профиль:
   python experiments_-10_10/train_RTX4070.py --dry-run
   python experiments_-10_10/train_RTX3090Ti.py --epochs 1
+  python experiments_-10_10/train_RTX4070.py --task score --dry-run
 Параметры: python experiments_-10_10/train_RTX4070.py --help.
 Этот модуль отдельно не запускается. Формат разметки описан в соседнем README.md.
 """
@@ -31,6 +35,9 @@ import random
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from model_tasks import (EXTREME_PROMPT, TASKS, balance_training, classification_metrics,
+                         parse_response, score_class)
 MSK = timezone(timedelta(hours=3))
 HORIZONS = (5, 15, 30, 60, 120)
 PROFILES = {
@@ -173,17 +180,19 @@ def split_examples(rows, start, validation_start, cutoff):
 
 
 def make_messages(row):
-    """Возвращает вход чата из заголовка, инструмента и горизонта без будущих метрик."""
+    """Возвращает чат по row с заданием его task; во входе только заголовок, инструмент и горизонт."""
     payload = dict(title=row['title'], instrument=row['instrument'], horizon_minutes=row['horizon'])
-    return [dict(role='system', content=SYSTEM_PROMPT),
+    prompt = EXTREME_PROMPT if row.get('task') == 'extremes' else SYSTEM_PROMPT
+    return [dict(role='system', content=prompt),
             dict(role='user', content=json.dumps(payload, ensure_ascii=False))]
 
 
 def encode_example(row, tokenizer, max_length):
-    """Возвращает токены с маской входа; отвергает превышение max_length и сдвиг шаблона."""
+    """Возвращает токены ответа по row.task с маской входа; отвергает превышение max_length."""
     messages = make_messages(row)
     prefix = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
-    answer = json.dumps({'score': row['score']}, separators=(',', ':'))
+    target = {'class': score_class(row['score'])} if row.get('task') == 'extremes' else {'score': row['score']}
+    answer = json.dumps(target, separators=(',', ':'))
     full = tokenizer.apply_chat_template(messages + [dict(role='assistant', content=answer)],
                                          tokenize=True, add_generation_prompt=False)
     if full[:len(prefix)] != prefix or len(full) <= len(prefix):
@@ -213,11 +222,12 @@ class TokenizedExamples:
 
 
 def summarize(rows):
-    """Возвращает размеры, диапазон дат и распределения баллов для rows."""
+    """Возвращает размеры, даты, распределения исходных баллов и трёх классов для rows."""
     return dict(rows=len(rows), news=len({r['news_id'] for r in rows}),
                 first_loaded_at=rows[0]['loaded_at'].isoformat(),
                 last_loaded_at=rows[-1]['loaded_at'].isoformat(),
                 scores=dict(sorted(Counter(str(r['score']) for r in rows).items())),
+                classes=dict(Counter(score_class(r['score']) for r in rows)),
                 tasks=dict(Counter(f"{r['instrument']}_{r['horizon']}" for r in rows)),
                 without_group_id=sum(not r['group_id'] for r in rows))
 
@@ -230,12 +240,13 @@ def save_json(path, payload):
 def evaluate_predictions(model, tokenizer, rows, limit, seed):
     """Генерирует ответы на воспроизводимой подвыборке rows и возвращает метрики/предсказания.
 
-    limit=0 означает всю валидацию. MAE считается по корректным JSON-ответам;
-    отдельно фиксируется доля ошибок формата и MAE нулевого прогноза на тех же строках.
+    limit=0 означает всю валидацию. Для extremes считает precision/recall классов;
+    для score — MAE и нулевой ориентир. Сохраняет исходный actual-балл в обоих режимах.
     """
     import torch
 
     selected = random.Random(seed).sample(rows, min(limit, len(rows))) if limit else list(rows)
+    task = rows[0].get('task', 'score')
     predictions, errors, zero_errors = [], [], []
     model.eval()
     model.config.use_cache = True
@@ -250,17 +261,18 @@ def evaluate_predictions(model, tokenizer, rows, limit, seed):
         text = tokenizer.decode(generated[0, len(ids):], skip_special_tokens=True).strip()
         predicted = None
         try:
-            decoded = json.loads(text)
-            value = decoded['score']
-            if isinstance(value, int) and not isinstance(value, bool) and -10 <= value <= 10:
-                predicted = value
-        except (ValueError, TypeError, KeyError):
+            predicted = parse_response(text, task)
+        except ValueError:
             pass
         predictions.append(dict(news_id=row['news_id'], instrument=row['instrument'],
                                 horizon=row['horizon'], actual=row['score'], predicted=predicted, raw=text))
-        if predicted is not None:
+        if task == 'extremes':
+            predictions[-1]['actual_class'] = score_class(row['score'])
+        if task == 'score' and predicted is not None:
             errors.append(abs(predicted - row['score']))
             zero_errors.append(abs(row['score']))
+    if task == 'extremes':
+        return classification_metrics(predictions), predictions
     return dict(sample_size=len(selected), valid_answers=len(errors),
                 invalid_fraction=1 - len(errors) / len(selected),
                 mae=sum(errors) / len(errors) if errors else None,
@@ -271,8 +283,8 @@ def evaluate_predictions(model, tokenizer, rows, limit, seed):
 def train_adapter(args, train_rows, validation_rows):
     """Обучает QLoRA по args, сохраняет адаптер и отчёты; требует CUDA и зависимости.
 
-    Исходные веса загружаются с Hugging Face в локальный кэш. База заморожена,
-    обучаются LoRA-матрицы. Сохранённый адаптер совместим только с той же базой.
+    train_rows уже преобразованы и сбалансированы в main, validation_rows сохранены
+    без балансировки. База из Hugging Face заморожена; обучаются только LoRA-матрицы.
     """
     cache = ROOT / 'data' / 'experiments_-10_10' / 'hf_cache'
     os.environ.setdefault('HF_HOME', str(cache))
@@ -329,7 +341,8 @@ def train_adapter(args, train_rows, validation_rows):
                       eval_dataset=valid_data,
                       data_collator=DataCollatorForSeq2Seq(tokenizer, padding=True, label_pad_token_id=-100))
     manifest = dict(profile=args.profile, model=args.model, revision=revision, gpu=gpu,
-                    parameters=vars(args), system_prompt=SYSTEM_PROMPT,
+                    parameters=vars(args), task=args.task,
+                    system_prompt=EXTREME_PROMPT if args.task == 'extremes' else SYSTEM_PROMPT,
                     packages={name: version(name) for name in
                               ('torch', 'transformers', 'peft', 'bitsandbytes', 'accelerate')},
                     validation_policy='chronological-purge-reprints-v1',
@@ -344,11 +357,13 @@ def train_adapter(args, train_rows, validation_rows):
     save_json(args.output / 'training_metrics.json', dict(train=trained.metrics, validation=validation_metrics))
     numeric, predictions = evaluate_predictions(model, tokenizer, validation_rows, args.prediction_limit, args.seed)
     save_json(args.output / 'score_metrics.json', numeric)
+    if args.task == 'extremes':
+        save_json(args.output / 'classification_metrics.json', numeric)
     save_json(args.output / 'validation_predictions.json', predictions)
     with (adapter_dir / 'adapter_model.safetensors').open('rb') as handle:
         adapter_digest = hashlib.file_digest(handle, 'sha256').hexdigest()
     save_json(args.output / 'adapter_provenance.json', dict(
-        model=args.model, revision=revision, adapter_sha256=adapter_digest))
+        model=args.model, revision=revision, task=args.task, adapter_sha256=adapter_digest))
     print(f'Адаптер сохранён: {adapter_dir}', flush=True)
 
 
@@ -359,8 +374,11 @@ def build_parser(profile):
     parser.add_argument('--data', type=Path,
                         default=ROOT / 'data' / 'experiments_-10_10' / 'scores.jsonl',
                         help='Готовая разметка CSV/JSONL; по умолчанию data/experiments_-10_10/scores.jsonl')
-    parser.add_argument('--output', type=Path, default=ROOT / 'data' / 'experiments_-10_10' / profile,
-                        help='Каталог результатов; непустой каталог обучения не перезаписывается')
+    parser.add_argument('--task', choices=TASKS, default='extremes', help='Задача: extremes (по умолчанию) либо прежний score')
+    parser.add_argument('--balance', choices=('oversample', 'none'), default='oversample',
+                        help='Балансировка классов extremes только в обучении; по умолчанию oversample')
+    parser.add_argument('--output', type=Path,
+                        help='Каталог: data/experiments_-10_10/PROFILE_extremes либо PROFILE для score')
     parser.add_argument('--model', default=defaults['model'], help='Идентификатор модели Hugging Face')
     parser.add_argument('--revision', default='main', help='Ревизия базы; разрешённый SHA сохраняется в отчёте')
     parser.add_argument('--train-start', default='2025-09-01', help='Начало истории, включительно, МСК')
@@ -373,20 +391,23 @@ def build_parser(profile):
     parser.add_argument('--max-length', type=int, default=512, help='Максимум токенов входа и ответа; превышение — ошибка')
     parser.add_argument('--rank', type=int, default=16, help='Ранг LoRA')
     parser.add_argument('--learning-rate', type=float, default=1e-4, help='Начальная скорость обучения')
-    parser.add_argument('--prediction-limit', type=int, default=256, help='Число проверяемых генерацией ответов; 0 — все')
+    parser.add_argument('--prediction-limit', type=int,
+                        help='Лимит генерации; по умолчанию вся валидация extremes, 256 для score; 0 — все')
     parser.add_argument('--seed', type=int, default=42, help='Начальное состояние генераторов случайных чисел')
     parser.add_argument('--dry-run', action='store_true', help='Только проверка данных, без модели и GPU')
     return parser
 
 
 def main(profile, argv=None):
-    """Запускает профиль с аргументами argv (по умолчанию CLI), возвращает код завершения."""
+    """Делит данные по времени, задаёт классы и балансирует только обучение; запускает профиль argv."""
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, 'reconfigure'):
             stream.reconfigure(encoding='utf-8')
     parser = build_parser(profile)
     args = parser.parse_args(argv)
     args.profile = profile
+    args.prediction_limit = args.prediction_limit if args.prediction_limit is not None else (0 if args.task == 'extremes' else 256)
+    args.output = args.output or ROOT / 'data' / 'experiments_-10_10' / (profile + ('_extremes' if args.task == 'extremes' else ''))
     try:
         if (any(getattr(args, name) <= 0 for name in ('batch_size', 'accumulation', 'max_length', 'rank'))
                 or not math.isfinite(args.epochs) or args.epochs <= 0
@@ -395,6 +416,15 @@ def main(profile, argv=None):
             raise ValueError('Параметры размеров/скорости/эпох должны быть положительными; проверьте лимиты')
         rows, read_stats = read_examples(args.data)
         train, valid, split_stats = split_examples(rows, args.train_start, args.validation_start, args.cutoff)
+        train = [dict(r, task=args.task) for r in train]
+        valid = [dict(r, task=args.task) for r in valid]
+        original_train = summarize(train)
+        balance = dict(method='none')
+        if args.task == 'extremes':
+            if set(score_class(r['score']) for r in train) != {'negative', 'none', 'positive'}:
+                raise ValueError('В обучении должны присутствовать все три класса')
+            if args.balance == 'oversample':
+                train, balance = balance_training(train, args.seed)
         args.output = args.output.resolve()
         if args.output.exists():
             allowed = {'data_report.json'}
@@ -403,7 +433,8 @@ def main(profile, argv=None):
         args.output.mkdir(parents=True, exist_ok=True)
         with args.data.open('rb') as handle:
             digest = hashlib.file_digest(handle, 'sha256').hexdigest()
-        report = dict(profile=profile, model=args.model, data_sha256=digest, parameters=vars(args),
+        report = dict(profile=profile, task=args.task, model=args.model, data_sha256=digest, parameters=vars(args),
+                      train_before_balance=original_train, balance=balance,
                       read=read_stats, split=split_stats, train=summarize(train), validation=summarize(valid),
                       warning='Без group_id обнаруживаются только точные нормализованные перепечатки; '
                               'близкие переформулировки требуют предварительной группировки.')

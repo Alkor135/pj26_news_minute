@@ -2,6 +2,7 @@
 
 Создаёт временные JSONL только внутри tests; тяжёлые библиотеки и GPU не нужны.
 Проверяет также выбор результата разметки по умолчанию для обоих профилей.
+Прежний числовой режим запускается с явным --task score.
 Общий модуль загружается из experiments_-10_10/source/training_common.py.
 Запуск из корня: python -m unittest discover -s tests/experiments_-10_10 -v.
 """
@@ -138,6 +139,7 @@ class TrainingTests(unittest.TestCase):
                 sys.executable, str(EXPERIMENT / f'train_{gpu}.py'),
                 '--data', str(Path(self.tmp.name) / 'scores.jsonl'),
                 '--output', str(output), '--dry-run',
+                '--task', 'score',
             ], capture_output=True, text=True, encoding='utf-8')
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             report = json.loads((output / 'data_report.json').read_text(encoding='utf-8'))

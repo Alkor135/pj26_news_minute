@@ -3,6 +3,7 @@ r"""Проверяет защиту экспорта и импорта моде�
 Создаёт временные учебные артефакты только внутри tests.
 Проверяет также запуск экспорта без параметров и неоднозначный выбор обучения.
 Для импорта проверяет выбор экспорта без параметров и отказ при неоднозначности.
+Проверяет также передачу задачи extremes через экспорт и пробный ответ импорта.
 Запуск: .\.venv\Scripts\python.exe -m unittest discover -s tests/experiments_-10_10 -v
 """
 
@@ -113,6 +114,24 @@ class OllamaTransferTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'завершён'):
             self.export.validate_training_run(run)
 
+    def test_export_rejects_changed_task(self):
+        """Замена задачи без соответствующей отметки адаптера отклоняется."""
+        run = self.training_run()
+        path = run / 'training_manifest.json'
+        manifest = json.loads(path.read_text(encoding='utf-8'))
+        manifest['task'] = 'extremes'
+        path.write_text(json.dumps(manifest), encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'Задача'):
+            self.export.validate_training_run(run)
+
+    def test_import_smoke_uses_class_contract(self):
+        """Импорт extremes принимает класс, а старый балльный ответ отвергает."""
+        with patch.object(self.importer, 'api_json', return_value={'message': {'content': '{"class":"positive"}'}}):
+            self.assertEqual(self.importer.smoke_test('http://localhost', 'example', 'extremes')[1], 'positive')
+        with patch.object(self.importer, 'api_json', return_value={'message': {'content': '{"score":8}'}}):
+            with self.assertRaises(ValueError):
+                self.importer.smoke_test('http://localhost', 'example', 'extremes')
+
     def test_export_rejects_swapped_adapter_of_same_model(self):
         """Адаптер другого запуска с тем же именем базы обнаруживается по SHA."""
         run = self.training_run()
@@ -171,6 +190,11 @@ class OllamaTransferTests(unittest.TestCase):
     def test_export_publishes_complete_folder_only_after_conversion(self):
         """Готовый каталог появляется после конверсии с проверенным GGUF и манифестом."""
         run = self.training_run()
+        for filename in ('training_manifest.json', 'adapter_provenance.json'):
+            path = run / filename
+            payload = json.loads(path.read_text(encoding='utf-8'))
+            payload['task'] = 'extremes'
+            path.write_text(json.dumps(payload), encoding='utf-8')
         converter = self.root / 'convert_hf_to_gguf.py'
         quantizer = self.root / 'llama-quantize.exe'
         converter.write_text('# пример', encoding='utf-8')
@@ -184,7 +208,7 @@ class OllamaTransferTests(unittest.TestCase):
             """Имитирует только тяжёлую загрузку весов, создавая выходной файл."""
             merged.mkdir()
             (merged / 'model.safetensors').write_bytes(b'merged')
-            return {'status': 'passed', 'score': -3, 'answer': '{"score":-3}'}
+            return {'status': 'passed', 'class': 'negative', 'answer': '{"class":"negative"}'}
 
         def fake_conversion(merged, convert_tool, quant_tool, folder, quantization, converter_python):
             """Имитирует только внешнюю конвертацию, создавая сигнатуру GGUF."""
@@ -203,6 +227,7 @@ class OllamaTransferTests(unittest.TestCase):
         self.assertEqual(manifest['gguf_sha256'], hashlib.sha256(b'GGUFexample').hexdigest())
         self.assertEqual(manifest['f16_gguf_sha256'], hashlib.sha256(b'GGUFfull').hexdigest())
         self.assertEqual(manifest['revision'], 'a' * 40)
+        self.assertEqual(manifest['task'], 'extremes')
         with self.assertRaisesRegex(ValueError, 'существует'):
             self.export.export_run(args)
 

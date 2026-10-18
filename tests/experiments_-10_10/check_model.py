@@ -8,12 +8,15 @@ r"""Проверяет импортированную модель Ollama на �
 По умолчанию проверяет первые 32 сохранённых примера; --limit 0 — все.
 Сентябрь не использует. Проверяет качество баллов, а не доходность торговли.
 Перезаписывает check_model_report.json в каталоге обучения; файловых логов нет.
+Для задачи extremes вместо MAE считает precision/recall по трём классам
+и матрицу ошибок. Профили PROFILE_extremes поддерживаются отдельно от score.
 
 Запуск из корня проекта или кнопкой VS Code, при работающей Ollama:
   .\.venv\Scripts\python.exe tests/experiments_-10_10/check_model.py
   .\.venv\Scripts\python.exe tests/experiments_-10_10/check_model.py --limit 0
   .\.venv\Scripts\python.exe tests/experiments_-10_10/check_model.py --run data/experiments_-10_10/RTX3090Ti
   .\.venv\Scripts\python.exe tests/experiments_-10_10/check_model.py --prepare-only
+  .\.venv\Scripts\python.exe tests/experiments_-10_10/check_model.py --run data/experiments_-10_10/RTX4070_extremes --limit 0
 Параметры --name и --host выбирают модель и сервер; --data задаёт перенесённую
 разметку с тем же SHA-256. --prepare-only проверяет данные без вызовов Ollama.
 """
@@ -30,6 +33,7 @@ sys.path.insert(0, str(ROOT / 'experiments_-10_10'))
 sys.path.insert(0, str(ROOT / 'experiments_-10_10' / 'source'))
 import import_ollama as ollama
 import training_common as training
+from model_tasks import classification_metrics, parse_response, run_directories, score_class, task_name
 
 
 def metrics(predictions):
@@ -50,8 +54,8 @@ def metrics(predictions):
                 direction_sample_size=len(nonzero))
 
 
-def predict(host, name, row, system_prompt):
-    """Запрашивает модель name на host по row без метки; возвращает ответ, балл и задержку."""
+def predict(host, name, row, system_prompt, task='score'):
+    """Запрашивает модель name на host по row без метки; возвращает текст, значение task и задержку."""
     payload = dict(title=row['title'], instrument=row['instrument'], horizon_minutes=row['horizon'])
     started = time.perf_counter()
     response = ollama.api_json(host, '/api/chat', {
@@ -63,12 +67,13 @@ def predict(host, name, row, system_prompt):
         raise ValueError('Неверная структура ответа Ollama')
     answer = response['message'].get('content')
     elapsed = time.perf_counter() - started
-    return answer, ollama.parse_score(answer), elapsed
+    return answer, parse_response(answer, task), elapsed
 
 
 def prepare_cases(run, data, limit):
     """Проверяет run и SHA разметки data; возвращает выбранные валидационные строки и манифест."""
     manifest = json.loads((run / 'training_manifest.json').read_text(encoding='utf-8'))
+    task_name(manifest)
     report = json.loads((run / 'data_report.json').read_text(encoding='utf-8'))
     if ollama.sha256_file(data) != report['data_sha256']:
         raise ValueError('Разметка отличается от обучения по SHA-256; требуется исходный файл')
@@ -115,8 +120,8 @@ def main(argv=None):
             raise ValueError('--limit должен быть неотрицательным')
         if args.run is None:
             base = ROOT / 'data/experiments_-10_10'
-            candidates = [base / p for p in ollama.DEFAULT_NAMES
-                          if (base / p / 'export/import_report.json').is_file()]
+            candidates = [path for path in run_directories(base)
+                          if (path / 'export/import_report.json').is_file()]
             if len(candidates) != 1:
                 raise ValueError('Нужен единственный импортированный профиль или явный --run ПУТЬ')
             run = candidates[0]
@@ -127,6 +132,9 @@ def main(argv=None):
         if args.prepare_only:
             return 0
         imported = json.loads((run / 'export/import_report.json').read_text(encoding='utf-8'))
+        task = task_name(manifest)
+        if task_name(imported) != task:
+            raise ValueError('Задача импорта не совпадает с задачей обучения')
         name = args.name or imported['ollama_name']
         host = args.host or imported['host']
         names = ollama.existing_models(host)
@@ -136,20 +144,24 @@ def main(argv=None):
         for number, row in enumerate(rows, 1):
             result = dict(news_id=row['news_id'], instrument=row['instrument'], horizon=row['horizon'],
                           actual=row['score'], adapter_predicted=row['adapter_predicted'], predicted=None)
+            if task == 'extremes':
+                result['actual_class'] = score_class(row['score'])
             try:
-                raw, score, elapsed = predict(host, name, row, manifest['system_prompt'])
+                raw, score, elapsed = predict(host, name, row, manifest['system_prompt'], task)
                 result.update(raw=raw, predicted=score, seconds=elapsed)
             except ValueError as error:
                 result['error'] = str(error)
             predictions.append(result)
+            actual_text = f'{score_class(row["score"])} (балл {row["score"]})' if task == 'extremes' else str(row['score'])
             print(f'{number}/{len(rows)}: {row["instrument"]} {row["horizon"]} мин; '
-                  f'факт={row["score"]}, прогноз={result["predicted"]}', flush=True)
-        summary = metrics(predictions)
-        adapter = metrics([dict(actual=p['actual'], predicted=p['adapter_predicted']) for p in predictions])
-        groups = {f'{i}_{h}': metrics([p for p in predictions if p['instrument'] == i and p['horizon'] == h])
+                  f'факт={actual_text}, прогноз={result["predicted"]}', flush=True)
+        metric_function = classification_metrics if task == 'extremes' else metrics
+        summary = metric_function(predictions)
+        adapter = metric_function([dict(actual=p['actual'], predicted=p['adapter_predicted']) for p in predictions])
+        groups = {f'{i}_{h}': metric_function([p for p in predictions if p['instrument'] == i and p['horizon'] == h])
                   for i in ('MIX', 'RTS') for h in training.HORIZONS
                   if any(p['instrument'] == i and p['horizon'] == h for p in predictions)}
-        report = dict(ollama_name=name, host=host, model_identity_verified=False,
+        report = dict(ollama_name=name, host=host, task=task, model_identity_verified=False,
                       note='Проверяется модель под указанным именем; её веса могли быть заменены после импорта.',
                       data_sha256=ollama.sha256_file(args.data),
                       period={k: manifest['parameters'][k] for k in ('validation_start', 'cutoff')},
